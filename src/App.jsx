@@ -2,10 +2,19 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const ACCEPTED_TYPES = 'audio/*,.mp3,.wav,.ogg,.m4a'
-const CAPTION_LINES = {
-  minimal: ['SIGNAL IN MOTION', 'AUDIO / NOW', 'STAY WITH THE PULSE', 'LISTEN CLOSER'],
-  poetic: ['THE AIR LEANS IN', 'A RED THREAD OF SOUND', 'WHERE THE ROOM STARTS MOVING', 'ECHOES FIND THEIR SHAPE'],
-  technical: ['LOW BAND DETECTED', 'MID RANGE SHIFT', 'AMPLITUDE IN TRANSIT', 'SPECTRUM / LIVE'],
+
+function parseLrc(text) {
+  const parsed = []
+  text.split(/\r?\n/).forEach((line) => {
+    const timestamps = [...line.matchAll(/\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]/g)]
+    const lyric = line.replace(/\[\d{1,3}:\d{2}(?:\.\d{1,3})?\]/g, '').trim()
+    if (!lyric) return
+    timestamps.forEach((match) => {
+      const fraction = match[3] ? Number(`0.${match[3]}`) : 0
+      parsed.push({ time: Number(match[1]) * 60 + Number(match[2]) + fraction, text: lyric })
+    })
+  })
+  return parsed.sort((a, b) => a.time - b.time)
 }
 
 function formatTime(value) {
@@ -13,6 +22,50 @@ function formatTime(value) {
   const minutes = Math.floor(value / 60)
   const seconds = Math.floor(value % 60).toString().padStart(2, '0')
   return `${minutes}:${seconds}`
+}
+
+function lyricFont(style, size) {
+  if (style === 'poetic') return `italic ${size}px Georgia, serif`
+  if (style === 'technical') return `${size}px ui-monospace, SFMono-Regular, Menlo, monospace`
+  return `600 ${size}px Arial, Helvetica, sans-serif`
+}
+
+function fitLyricText(context, text, requestedSize, maxWidth, maxHeight, style) {
+  const words = text.toUpperCase().split(/\s+/).filter(Boolean)
+  let size = Math.max(10, requestedSize)
+  let lines = []
+  let maxLineWidth
+  while (size >= 10) {
+    context.font = lyricFont(style, size)
+    lines = []
+    let currentLine = ''
+    words.forEach((word) => {
+      const candidate = currentLine ? `${currentLine} ${word}` : word
+      if (currentLine && context.measureText(candidate).width > maxWidth) {
+        lines.push(currentLine)
+        currentLine = word
+      } else {
+        currentLine = candidate
+      }
+    })
+    if (currentLine) lines.push(currentLine)
+    const lineHeight = size * 1.18
+    maxLineWidth = Math.max(...lines.map((line) => context.measureText(line).width), 0)
+    if (lines.length * lineHeight <= maxHeight && maxLineWidth <= maxWidth) {
+      return { font: context.font, lineHeight, lines, scaleX: 1, totalHeight: lines.length * lineHeight }
+    }
+    size *= 0.9
+  }
+
+  context.font = lyricFont(style, 10)
+  maxLineWidth = Math.max(...lines.map((line) => context.measureText(line).width), 1)
+  return {
+    font: context.font,
+    lineHeight: 12,
+    lines,
+    scaleX: Math.min(1, maxWidth / maxLineWidth),
+    totalHeight: lines.length * 12,
+  }
 }
 
 function App() {
@@ -24,18 +77,19 @@ function App() {
   const animationRef = useRef(null)
   const drawRef = useRef(null)
   const isPlayingRef = useRef(false)
-  const reactiveLevelsRef = useRef({ bass: 0, mid: 0, overall: 0 })
-  const captionRef = useRef({ section: -1, text: '', changedAt: 0 })
+  const captionRef = useRef({ index: -1, text: '', changedAt: 0 })
+  const lyricLevelsRef = useRef({ bass: 0, mid: 0, overall: 0 })
   const [file, setFile] = useState(null)
   const [audioUrl, setAudioUrl] = useState(null)
   const [mode, setMode] = useState('bars')
-  const [displayText, setDisplayText] = useState('LISTEN / LOOK')
-  const [showTypography, setShowTypography] = useState(true)
-  const [textSize, setTextSize] = useState(72)
-  const [textColor, setTextColor] = useState('#d83a2f')
-  const [reactionIntensity, setReactionIntensity] = useState(1)
   const [showCaptions, setShowCaptions] = useState(true)
   const [captionStyle, setCaptionStyle] = useState('minimal')
+  const [lyricSize, setLyricSize] = useState(24)
+  const [lyricX, setLyricX] = useState(50)
+  const [lyricY, setLyricY] = useState(82)
+  const [lyricReaction, setLyricReaction] = useState(1)
+  const [lyricFile, setLyricFile] = useState(null)
+  const [lyrics, setLyrics] = useState([])
   const [isPlaying, setIsPlaying] = useState(false)
   const [volume, setVolume] = useState(0.8)
   const [progress, setProgress] = useState(0)
@@ -77,9 +131,21 @@ function App() {
     const data = new Uint8Array(analyser.frequencyBinCount)
     const frequencyData = new Uint8Array(analyser.frequencyBinCount)
     analyser.getByteFrequencyData(frequencyData)
+    const average = (start, end) => frequencyData.slice(start, end).reduce((sum, value) => sum + value, 0) / ((end - start) * 255)
+    const levels = lyricLevelsRef.current
+    const targetLevels = {
+      bass: average(0, Math.max(1, Math.floor(frequencyData.length * 0.12))),
+      mid: average(Math.floor(frequencyData.length * 0.12), Math.max(1, Math.floor(frequencyData.length * 0.45))),
+      overall: average(0, frequencyData.length),
+    }
+    levels.bass += (targetLevels.bass - levels.bass) * 0.14
+    levels.mid += (targetLevels.mid - levels.mid) * 0.12
+    levels.overall += (targetLevels.overall - levels.overall) * 0.1
     const accent = '#d83a2f'
     if (mode === 'waveform') {
       analyser.getByteTimeDomainData(data)
+      context.save()
+      context.globalAlpha = 0.28
       context.beginPath()
       context.strokeStyle = accent
       context.lineWidth = 2 * pixelRatio
@@ -90,80 +156,62 @@ function App() {
         else context.lineTo(x, y)
       })
       context.stroke()
+      context.restore()
     } else {
-      analyser.getByteFrequencyData(data)
       const bars = Math.min(72, Math.floor(width / (pixelRatio * 8)))
       const gap = 3 * pixelRatio
       const barWidth = Math.max(2 * pixelRatio, (width - gap * (bars - 1)) / bars)
+      context.save()
+      context.globalAlpha = 0.24
       context.fillStyle = accent
       for (let index = 0; index < bars; index += 1) {
-        const sampleIndex = Math.floor((index / bars) ** 1.65 * data.length * 0.72)
-        const level = data[sampleIndex] / 255
+        const sampleIndex = Math.floor((index / bars) ** 1.65 * frequencyData.length * 0.72)
+        const level = frequencyData[sampleIndex] / 255
         const barHeight = Math.max(3 * pixelRatio, level ** 0.85 * height * 0.74)
         const x = index * (barWidth + gap)
         context.fillRect(x, height - barHeight, barWidth, barHeight)
       }
-    }
-    if (showTypography && displayText.trim()) {
-      const bassEnd = Math.max(1, Math.floor(frequencyData.length * 0.12))
-      const midStart = Math.floor(frequencyData.length * 0.12)
-      const midEnd = Math.max(midStart + 1, Math.floor(frequencyData.length * 0.45))
-      const average = (start, end) => frequencyData.slice(start, end).reduce((sum, value) => sum + value, 0) / ((end - start) * 255)
-      const levels = reactiveLevelsRef.current
-      const target = { bass: average(0, bassEnd), mid: average(midStart, midEnd), overall: average(0, frequencyData.length) }
-      levels.bass += (target.bass - levels.bass) * 0.14
-      levels.mid += (target.mid - levels.mid) * 0.12
-      levels.overall += (target.overall - levels.overall) * 0.1
-      const scale = 1 + levels.bass * 0.42 * reactionIntensity
-      const letterSpacing = levels.mid * 13 * reactionIntensity
-      const fontSize = Math.min(height * 0.42, textSize * pixelRatio * scale)
-      const label = displayText.trim().toUpperCase()
-      context.save()
-      context.font = `600 ${fontSize}px Arial, Helvetica, sans-serif`
-      context.textAlign = 'center'
-      context.textBaseline = 'middle'
-      context.fillStyle = textColor
-      context.globalAlpha = Math.min(0.96, 0.42 + levels.overall * 0.58)
-      const x = width / 2 + (levels.mid - 0.35) * width * 0.18 * reactionIntensity
-      const y = height / 2
-      const characters = [...label]
-      const widths = characters.map((character) => context.measureText(character).width)
-      const totalWidth = widths.reduce((sum, value) => sum + value, 0) + letterSpacing * pixelRatio * Math.max(0, characters.length - 1)
-      let cursor = x - totalWidth / 2
-      characters.forEach((character, index) => {
-        const characterWidth = widths[index]
-        context.fillText(character, cursor + characterWidth / 2, y)
-        cursor += characterWidth + letterSpacing * pixelRatio
-      })
       context.restore()
     }
-
-    if (showCaptions && audioRef.current) {
+    if (showCaptions && audioRef.current && lyrics.length) {
       const currentTime = audioRef.current.currentTime || 0
-      const sectionLength = duration > 0 ? Math.max(3.5, Math.min(7, duration / 8)) : 4
-      const section = Math.floor(currentTime / sectionLength)
-      const levels = reactiveLevelsRef.current
-      const lines = CAPTION_LINES[captionStyle]
-      const energyOffset = levels.bass > 0.55 ? 1 : levels.mid > 0.42 ? 2 : levels.overall < 0.16 ? 3 : 0
-      const lineIndex = (section + energyOffset) % lines.length
-      const nextText = lines[lineIndex]
-      if (captionRef.current.section !== section || captionRef.current.text !== nextText) {
-        captionRef.current = { section, text: nextText, changedAt: performance.now() }
+      let lyricIndex = -1
+      for (let index = 0; index < lyrics.length; index += 1) {
+        if (lyrics[index].time > currentTime) break
+        lyricIndex = index
       }
+      if (lyricIndex >= 0 && captionRef.current.index !== lyricIndex) {
+        captionRef.current = { index: lyricIndex, text: lyrics[lyricIndex].text, changedAt: performance.now() }
+      }
+      if (lyricIndex >= 0) {
       const elapsed = performance.now() - captionRef.current.changedAt
       const transition = Math.min(1, elapsed / 360)
       context.save()
-      context.globalAlpha = transition * Math.min(0.9, 0.42 + levels.overall * 0.48)
+      const lyricScale = 1 + levels.bass * 0.3 * lyricReaction
+      const maxWidth = width * 0.82
+      const maxHeight = height * 0.3
+      const lyricFontSize = Math.min(height * 0.2, lyricSize * pixelRatio * lyricScale)
+      const lyricLayout = fitLyricText(context, captionRef.current.text, lyricFontSize, maxWidth, maxHeight, captionStyle)
+      const movement = (levels.mid - 0.25) * width * 0.08 * lyricReaction
+      const x = Math.max(width * 0.09, Math.min(width * 0.91, width * (lyricX / 100) + movement))
+      const y = Math.max(lyricLayout.totalHeight / 2, Math.min(height - lyricLayout.totalHeight / 2, height * (lyricY / 100) - levels.mid * height * 0.035 * lyricReaction))
+      context.globalAlpha = transition * Math.min(0.98, 0.72 + levels.overall * 0.26)
       context.fillStyle = captionStyle === 'technical' ? '#181816' : accent
-      context.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace'
-      context.letterSpacing = '0.12em'
+      context.font = lyricLayout.font
       context.textAlign = 'center'
-      context.textBaseline = 'bottom'
-      context.fillText(captionRef.current.text, width / 2 + (1 - transition) * 10 * pixelRatio, height - 18 * pixelRatio)
+      context.textBaseline = 'middle'
+      const drawX = x + (1 - transition) * 10 * pixelRatio
+      context.translate(drawX, y)
+      context.scale(lyricLayout.scaleX, 1)
+      lyricLayout.lines.forEach((line, index) => {
+        const lineY = (index - (lyricLayout.lines.length - 1) / 2) * lyricLayout.lineHeight
+        context.fillText(line, 0, lineY)
+      })
       context.restore()
+      }
     }
     if (isPlayingRef.current) animationRef.current = requestAnimationFrame(() => drawRef.current?.())
-  }, [captionStyle, displayText, duration, mode, reactionIntensity, showCaptions, showTypography, textColor, textSize])
+  }, [captionStyle, lyricReaction, lyricSize, lyricX, lyricY, lyrics, mode, showCaptions])
 
   const setupAudioGraph = useCallback(() => {
     if (audioContextRef.current) return audioContextRef.current
@@ -218,11 +266,26 @@ function App() {
     setError('')
     setProgress(0)
     setDuration(0)
-    captionRef.current = { section: -1, text: '', changedAt: 0 }
+    captionRef.current = { index: -1, text: '', changedAt: 0 }
+    lyricLevelsRef.current = { bass: 0, mid: 0, overall: 0 }
+    setLyricFile(null)
+    setLyrics([])
     if (fileUrlRef.current) URL.revokeObjectURL(fileUrlRef.current)
     fileUrlRef.current = URL.createObjectURL(nextFile)
     setAudioUrl(fileUrlRef.current)
     setFile(nextFile)
+  }
+
+  const handleLyricFileChange = async (event) => {
+    const nextFile = event.target.files?.[0]
+    if (!nextFile) return
+    const text = await nextFile.text()
+    const parsed = parseLrc(text)
+    captionRef.current = { index: -1, text: '', changedAt: 0 }
+    setLyricFile(nextFile)
+    setLyrics(parsed)
+    if (!parsed.length) setError('This .lrc file did not contain readable timestamped lyrics.')
+    else setError('')
   }
 
   const handleAudioError = () => {
@@ -240,7 +303,7 @@ function App() {
 
   useEffect(() => {
     if (analyserRef.current && !isPlaying) drawVisualization()
-  }, [captionStyle, displayText, drawVisualization, isPlaying, reactionIntensity, showCaptions, showTypography, textColor, textSize])
+  }, [captionStyle, drawVisualization, isPlaying, lyricReaction, lyricSize, lyricX, lyricY, lyrics, showCaptions])
 
   useEffect(() => () => {
     stopVisualization()
@@ -271,6 +334,7 @@ function App() {
           <div className="visualizer-wrap">
             <canvas ref={canvasRef} aria-label={`${mode} frequency visualization`} />
             {!file && <div className="empty-state"><span className="upload-glyph">+</span><p>Upload a track to begin the study</p><small>MP3 · WAV · OGG · M4A</small></div>}
+            {file && showCaptions && !lyrics.length && <div className="lyric-empty-state"><strong>NO SYNCED LYRICS</strong><span>Upload a user-provided .lrc file to display lyrics here.</span></div>}
           </div>
           <div className="caption-row"><span>FIG. 01 — REAL-TIME AUDIO ANALYSIS</span><span>THE CANVAS RESPONDS TO YOUR SOUND</span></div>
         </section>
@@ -281,20 +345,20 @@ function App() {
           <label className="file-button"><span>{file ? 'Change track' : 'Choose track'}</span><input type="file" accept={ACCEPTED_TYPES} onChange={handleFileChange} /></label>
         </section>
 
-        <section className="type-section">
-          <div className="section-label">TYPE / REACTION</div>
-          <label className="text-input-label">DISPLAY TEXT<input type="text" value={displayText} maxLength="32" onChange={(event) => setDisplayText(event.target.value)} /></label>
-          <label className="toggle-control"><input type="checkbox" checked={showTypography} onChange={(event) => setShowTypography(event.target.checked)} /><span className="toggle-ui" aria-hidden="true" /> SHOW TYPE</label>
-          <label className="range-control">SIZE <input type="range" min="32" max="130" value={textSize} onChange={(event) => setTextSize(Number(event.target.value))} /></label>
-          <label className="range-control">INTENSITY <input type="range" min="0" max="2" step="0.01" value={reactionIntensity} onChange={(event) => setReactionIntensity(Number(event.target.value))} /></label>
-          <label className="color-control">COLOR <input type="color" value={textColor} onChange={(event) => setTextColor(event.target.value)} /></label>
-        </section>
-
         <section className="caption-section">
-          <div className="section-label">GENERATED CAPTIONS</div>
-          <p className="caption-disclaimer">Original visual phrases, synced to the track’s current time and energy. Not verified lyrics.</p>
+          <div className="section-label">USER LYRICS</div>
+          <p className="caption-disclaimer">User-provided synchronized lyrics. Lines are displayed from their timestamps and are never generated by the visualizer.</p>
           <label className="toggle-control"><input type="checkbox" checked={showCaptions} onChange={(event) => setShowCaptions(event.target.checked)} /><span className="toggle-ui" aria-hidden="true" /> SYNCED CAPTIONS</label>
           <label className="caption-select">STYLE <select value={captionStyle} onChange={(event) => setCaptionStyle(event.target.value)}><option value="minimal">Minimal</option><option value="poetic">Poetic</option><option value="technical">Technical</option></select></label>
+          <label className="file-button lyric-file-button"><span>{lyricFile ? 'Change .lrc' : 'Upload .lrc lyrics'}</span><input type="file" accept=".lrc,text/plain" onChange={handleLyricFileChange} /></label>
+        </section>
+
+        <section className="lyric-control-section">
+          <div className="section-label">LYRIC / PLACEMENT</div>
+          <label className="range-control">SIZE <input type="range" min="12" max="72" value={lyricSize} onChange={(event) => setLyricSize(Number(event.target.value))} aria-label="Lyric text size" /></label>
+          <label className="range-control">HORIZONTAL <input type="range" min="10" max="90" value={lyricX} onChange={(event) => setLyricX(Number(event.target.value))} aria-label="Lyric horizontal position" /></label>
+          <label className="range-control">VERTICAL <input type="range" min="12" max="90" value={lyricY} onChange={(event) => setLyricY(Number(event.target.value))} aria-label="Lyric vertical position" /></label>
+          <label className="range-control">REACTION <input type="range" min="0" max="2" step="0.01" value={lyricReaction} onChange={(event) => setLyricReaction(Number(event.target.value))} aria-label="Lyric audio reaction intensity" /></label>
         </section>
 
         <audio ref={audioRef} src={audioUrl || undefined} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} onTimeUpdate={(event) => setProgress(event.currentTarget.currentTime)} onEnded={() => { setIsPlaying(false); isPlayingRef.current = false; stopVisualization() }} onError={handleAudioError} />

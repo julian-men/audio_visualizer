@@ -2,6 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const ACCEPTED_TYPES = 'audio/*,.mp3,.wav,.ogg,.m4a'
+const CAPTION_LINES = {
+  minimal: ['SIGNAL IN MOTION', 'AUDIO / NOW', 'STAY WITH THE PULSE', 'LISTEN CLOSER'],
+  poetic: ['THE AIR LEANS IN', 'A RED THREAD OF SOUND', 'WHERE THE ROOM STARTS MOVING', 'ECHOES FIND THEIR SHAPE'],
+  technical: ['LOW BAND DETECTED', 'MID RANGE SHIFT', 'AMPLITUDE IN TRANSIT', 'SPECTRUM / LIVE'],
+}
 
 function formatTime(value) {
   if (!Number.isFinite(value)) return '0:00'
@@ -18,9 +23,19 @@ function App() {
   const analyserRef = useRef(null)
   const animationRef = useRef(null)
   const drawRef = useRef(null)
+  const isPlayingRef = useRef(false)
+  const reactiveLevelsRef = useRef({ bass: 0, mid: 0, overall: 0 })
+  const captionRef = useRef({ section: -1, text: '', changedAt: 0 })
   const [file, setFile] = useState(null)
   const [audioUrl, setAudioUrl] = useState(null)
   const [mode, setMode] = useState('bars')
+  const [displayText, setDisplayText] = useState('LISTEN / LOOK')
+  const [showTypography, setShowTypography] = useState(true)
+  const [textSize, setTextSize] = useState(72)
+  const [textColor, setTextColor] = useState('#d83a2f')
+  const [reactionIntensity, setReactionIntensity] = useState(1)
+  const [showCaptions, setShowCaptions] = useState(true)
+  const [captionStyle, setCaptionStyle] = useState('minimal')
   const [isPlaying, setIsPlaying] = useState(false)
   const [volume, setVolume] = useState(0.8)
   const [progress, setProgress] = useState(0)
@@ -60,6 +75,8 @@ function App() {
     }
 
     const data = new Uint8Array(analyser.frequencyBinCount)
+    const frequencyData = new Uint8Array(analyser.frequencyBinCount)
+    analyser.getByteFrequencyData(frequencyData)
     const accent = '#d83a2f'
     if (mode === 'waveform') {
       analyser.getByteTimeDomainData(data)
@@ -87,8 +104,66 @@ function App() {
         context.fillRect(x, height - barHeight, barWidth, barHeight)
       }
     }
-    animationRef.current = requestAnimationFrame(() => drawRef.current?.())
-  }, [mode])
+    if (showTypography && displayText.trim()) {
+      const bassEnd = Math.max(1, Math.floor(frequencyData.length * 0.12))
+      const midStart = Math.floor(frequencyData.length * 0.12)
+      const midEnd = Math.max(midStart + 1, Math.floor(frequencyData.length * 0.45))
+      const average = (start, end) => frequencyData.slice(start, end).reduce((sum, value) => sum + value, 0) / ((end - start) * 255)
+      const levels = reactiveLevelsRef.current
+      const target = { bass: average(0, bassEnd), mid: average(midStart, midEnd), overall: average(0, frequencyData.length) }
+      levels.bass += (target.bass - levels.bass) * 0.14
+      levels.mid += (target.mid - levels.mid) * 0.12
+      levels.overall += (target.overall - levels.overall) * 0.1
+      const scale = 1 + levels.bass * 0.42 * reactionIntensity
+      const letterSpacing = levels.mid * 13 * reactionIntensity
+      const fontSize = Math.min(height * 0.42, textSize * pixelRatio * scale)
+      const label = displayText.trim().toUpperCase()
+      context.save()
+      context.font = `600 ${fontSize}px Arial, Helvetica, sans-serif`
+      context.textAlign = 'center'
+      context.textBaseline = 'middle'
+      context.fillStyle = textColor
+      context.globalAlpha = Math.min(0.96, 0.42 + levels.overall * 0.58)
+      const x = width / 2 + (levels.mid - 0.35) * width * 0.18 * reactionIntensity
+      const y = height / 2
+      const characters = [...label]
+      const widths = characters.map((character) => context.measureText(character).width)
+      const totalWidth = widths.reduce((sum, value) => sum + value, 0) + letterSpacing * pixelRatio * Math.max(0, characters.length - 1)
+      let cursor = x - totalWidth / 2
+      characters.forEach((character, index) => {
+        const characterWidth = widths[index]
+        context.fillText(character, cursor + characterWidth / 2, y)
+        cursor += characterWidth + letterSpacing * pixelRatio
+      })
+      context.restore()
+    }
+
+    if (showCaptions && audioRef.current) {
+      const currentTime = audioRef.current.currentTime || 0
+      const sectionLength = duration > 0 ? Math.max(3.5, Math.min(7, duration / 8)) : 4
+      const section = Math.floor(currentTime / sectionLength)
+      const levels = reactiveLevelsRef.current
+      const lines = CAPTION_LINES[captionStyle]
+      const energyOffset = levels.bass > 0.55 ? 1 : levels.mid > 0.42 ? 2 : levels.overall < 0.16 ? 3 : 0
+      const lineIndex = (section + energyOffset) % lines.length
+      const nextText = lines[lineIndex]
+      if (captionRef.current.section !== section || captionRef.current.text !== nextText) {
+        captionRef.current = { section, text: nextText, changedAt: performance.now() }
+      }
+      const elapsed = performance.now() - captionRef.current.changedAt
+      const transition = Math.min(1, elapsed / 360)
+      context.save()
+      context.globalAlpha = transition * Math.min(0.9, 0.42 + levels.overall * 0.48)
+      context.fillStyle = captionStyle === 'technical' ? '#181816' : accent
+      context.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace'
+      context.letterSpacing = '0.12em'
+      context.textAlign = 'center'
+      context.textBaseline = 'bottom'
+      context.fillText(captionRef.current.text, width / 2 + (1 - transition) * 10 * pixelRatio, height - 18 * pixelRatio)
+      context.restore()
+    }
+    if (isPlayingRef.current) animationRef.current = requestAnimationFrame(() => drawRef.current?.())
+  }, [captionStyle, displayText, duration, mode, reactionIntensity, showCaptions, showTypography, textColor, textSize])
 
   const setupAudioGraph = useCallback(() => {
     if (audioContextRef.current) return audioContextRef.current
@@ -119,6 +194,7 @@ function App() {
       try {
         await audioRef.current.play()
         setIsPlaying(true)
+        isPlayingRef.current = true
         stopVisualization()
         animationRef.current = requestAnimationFrame(() => drawRef.current?.())
       } catch {
@@ -127,6 +203,7 @@ function App() {
     } else {
       audioRef.current.pause()
       setIsPlaying(false)
+      isPlayingRef.current = false
       stopVisualization()
     }
   }
@@ -137,9 +214,11 @@ function App() {
     stopVisualization()
     audioRef.current?.pause()
     setIsPlaying(false)
+    isPlayingRef.current = false
     setError('')
     setProgress(0)
     setDuration(0)
+    captionRef.current = { section: -1, text: '', changedAt: 0 }
     if (fileUrlRef.current) URL.revokeObjectURL(fileUrlRef.current)
     fileUrlRef.current = URL.createObjectURL(nextFile)
     setAudioUrl(fileUrlRef.current)
@@ -158,6 +237,10 @@ function App() {
   useEffect(() => {
     drawRef.current = drawVisualization
   }, [drawVisualization])
+
+  useEffect(() => {
+    if (analyserRef.current && !isPlaying) drawVisualization()
+  }, [captionStyle, displayText, drawVisualization, isPlaying, reactionIntensity, showCaptions, showTypography, textColor, textSize])
 
   useEffect(() => () => {
     stopVisualization()
@@ -198,7 +281,23 @@ function App() {
           <label className="file-button"><span>{file ? 'Change track' : 'Choose track'}</span><input type="file" accept={ACCEPTED_TYPES} onChange={handleFileChange} /></label>
         </section>
 
-        <audio ref={audioRef} src={audioUrl || undefined} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} onTimeUpdate={(event) => setProgress(event.currentTarget.currentTime)} onEnded={() => { setIsPlaying(false); stopVisualization() }} onError={handleAudioError} />
+        <section className="type-section">
+          <div className="section-label">TYPE / REACTION</div>
+          <label className="text-input-label">DISPLAY TEXT<input type="text" value={displayText} maxLength="32" onChange={(event) => setDisplayText(event.target.value)} /></label>
+          <label className="toggle-control"><input type="checkbox" checked={showTypography} onChange={(event) => setShowTypography(event.target.checked)} /><span className="toggle-ui" aria-hidden="true" /> SHOW TYPE</label>
+          <label className="range-control">SIZE <input type="range" min="32" max="130" value={textSize} onChange={(event) => setTextSize(Number(event.target.value))} /></label>
+          <label className="range-control">INTENSITY <input type="range" min="0" max="2" step="0.01" value={reactionIntensity} onChange={(event) => setReactionIntensity(Number(event.target.value))} /></label>
+          <label className="color-control">COLOR <input type="color" value={textColor} onChange={(event) => setTextColor(event.target.value)} /></label>
+        </section>
+
+        <section className="caption-section">
+          <div className="section-label">GENERATED CAPTIONS</div>
+          <p className="caption-disclaimer">Original visual phrases, synced to the track’s current time and energy. Not verified lyrics.</p>
+          <label className="toggle-control"><input type="checkbox" checked={showCaptions} onChange={(event) => setShowCaptions(event.target.checked)} /><span className="toggle-ui" aria-hidden="true" /> SYNCED CAPTIONS</label>
+          <label className="caption-select">STYLE <select value={captionStyle} onChange={(event) => setCaptionStyle(event.target.value)}><option value="minimal">Minimal</option><option value="poetic">Poetic</option><option value="technical">Technical</option></select></label>
+        </section>
+
+        <audio ref={audioRef} src={audioUrl || undefined} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} onTimeUpdate={(event) => setProgress(event.currentTarget.currentTime)} onEnded={() => { setIsPlaying(false); isPlayingRef.current = false; stopVisualization() }} onError={handleAudioError} />
 
         <section className="transport-section">
           <div className="section-label">PLAYBACK</div>

@@ -282,6 +282,7 @@ function App() {
     const text = await nextFile.text()
     const parsed = parseLrc(text)
     captionRef.current = { index: -1, text: '', changedAt: 0 }
+    lyricLevelsRef.current = { bass: 0, mid: 0, overall: 0 }
     setLyricFile(nextFile)
     setLyrics(parsed)
     if (!parsed.length) setError('This .lrc file did not contain readable timestamped lyrics.')
